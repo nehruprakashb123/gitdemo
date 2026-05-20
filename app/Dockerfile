@@ -13,7 +13,7 @@ COPY main.py .
 COPY .env .env
 
 # Metadata for GHCR
-LABEL org.opencontainers.image.source=https://github.com/nehruprakashb123/fastapi
+LABEL org.opencontainers.image.source=https://github.com/nehruprakashb123/gitdemo
 LABEL org.opencontainers.image.description="DevOps AI Copilot"
 
 # Expose port

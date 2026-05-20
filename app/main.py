@@ -1,8 +1,13 @@
+"""
+DevOps AI Copilot with RAG (ChromaDB + Sentence Transformers)
+Full-featured FastAPI application
+"""
+
 import os
 import uuid
 import time
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -10,40 +15,54 @@ from pydantic import BaseModel
 from groq import Groq
 from dotenv import load_dotenv
 
-# Load environment variables
+# RAG
+from sentence_transformers import SentenceTransformer
+import chromadb
+
 load_dotenv()
 
 if not os.environ.get("GROQ_API_KEY"):
     print("⚠️  WARNING: GROQ_API_KEY is not set!")
 
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
+collection = chroma_client.get_or_create_collection(name="devops_knowledge")
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="DevOps AI Copilot",
-    description="Multi-turn chat with full history sent to Groq every time",
-    version="1.0.0",
+    title="DevOps AI Copilot with RAG",
+    description="Multi-turn chat with full history + Vector RAG (ChromaDB)",
+    version="1.1.0",
 )
 
-# ── Groq client ───────────────────────────────────────────────────────────────
+# ── Clients ───────────────────────────────────────────────────────────────────
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+
+# Embedding Model & Vector DB
+embedder = SentenceTransformer('all-MiniLM-L6-v2')
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
+collection = chroma_client.get_or_create_collection(name="devops_knowledge")
 
 MODEL         = "llama-3.1-8b-instant"
 MAX_TOKENS    = 1024
 TEMPERATURE   = 0.7
 
 SYSTEM_PROMPT = """You are a senior DevOps engineer and infrastructure expert.
-Help with Kubernetes, Terraform, CI/CD pipelines, Docker, ArgoCD, Helm, and cloud platforms.
-Be concise and practical. Always include relevant commands or config snippets.
-If you are unsure about something, say so clearly."""
+Use the provided context from knowledge base when relevant.
+Be concise, practical, and always include commands or YAML snippets."""
 
-# ── In-memory session store ───────────────────────────────────────────────────
+# ── In-memory Session Store ───────────────────────────────────────────────────
 sessions: dict[str, dict] = {}
 
 
-# ── Request / Response Models ─────────────────────────────────────────────────
+# ── Pydantic Models ───────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
     stream: bool = False
+
+
+class IngestRequest(BaseModel):
+    documents: List[str]
+    metadatas: Optional[List[dict]] = None
 
 
 class ChatResponse(BaseModel):
@@ -52,6 +71,12 @@ class ChatResponse(BaseModel):
     message_count: int
     total_tokens: int
     latency_ms: float
+
+
+class IngestResponse(BaseModel):
+    status: str
+    added_count: int
+    message: str
 
 
 class HistoryResponse(BaseModel):
@@ -74,56 +99,92 @@ class SessionSummary(BaseModel):
 def get_or_create_session(session_id: Optional[str]) -> str:
     if session_id and session_id in sessions:
         return session_id
-
     new_id = session_id or str(uuid.uuid4())
     sessions[new_id] = {
-        "history":       [],
-        "created_at":    datetime.utcnow().isoformat(),
-        "updated_at":    datetime.utcnow().isoformat(),
+        "history": [],
+        "created_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.utcnow().isoformat(),
         "message_count": 0,
-        "total_tokens":  0,
+        "total_tokens": 0
     }
     return new_id
 
 
-def build_messages(history: list[dict]) -> list[dict]:
-    """ 
-    IMPORTANT: Full history is sent on every call 
-    System prompt + entire conversation history
-    """
-    return [{"role": "system", "content": SYSTEM_PROMPT}] + history
+def build_messages(history: list, context: str = "") -> list:
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if context:
+        messages.append({"role": "system", "content": f"Relevant Context from Knowledge Base:\n{context}"})
+    messages.extend(history)
+    return messages
+
+
+def retrieve_context(query: str, top_k: int = 3) -> str:
+    """Retrieve relevant DevOps knowledge using embeddings"""
+    query_embedding = embedder.encode([query])[0].tolist()
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=top_k
+    )
+    if results and results['documents'] and results['documents'][0]:
+        return "\n\n".join(results['documents'][0])
+    return ""
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
-
 @app.get("/health")
 def health():
     return {
         "status": "ok",
         "model": MODEL,
-        "active_sessions": len(sessions),
-        "timestamp": datetime.utcnow().isoformat(),
+        "rag_enabled": True,
+        "knowledge_base_size": collection.count(),
+        "active_sessions": len(sessions)
     }
+
+
+@app.post("/ingest", response_model=IngestResponse)
+def ingest_knowledge(req: IngestRequest):
+    """Add DevOps documents, Kubernetes YAMLs, troubleshooting guides, etc."""
+    if not req.documents or len(req.documents) == 0:
+        raise HTTPException(status_code=400, detail="documents list cannot be empty")
+
+    metadatas = req.metadatas or [{} for _ in req.documents]
+    embeddings = embedder.encode(req.documents).tolist()
+
+    collection.add(
+        documents=req.documents,
+        embeddings=embeddings,
+        metadatas=metadatas,
+        ids=[str(uuid.uuid4()) for _ in req.documents]
+    )
+
+    return IngestResponse(
+        status="success",
+        added_count=len(req.documents),
+        message=f"Successfully added {len(req.documents)} document(s) to knowledge base."
+    )
 
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
-    """ Full history is sent to Groq on every request """
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="message cannot be empty")
 
     session_id = get_or_create_session(req.session_id)
     session = sessions[session_id]
 
-    # Append new user message
+    # Append user message
     session["history"].append({"role": "user", "content": req.message})
 
-    # Call Groq with FULL history every time
+    # Retrieve context from RAG
+    context = retrieve_context(req.message)
+
+    # Call Groq
     start = time.perf_counter()
     try:
         response = client.chat.completions.create(
             model=MODEL,
-            messages=build_messages(session["history"]),   # ← Full history sent
+            messages=build_messages(session["history"], context),
             max_tokens=MAX_TOKENS,
             temperature=TEMPERATURE,
         )
@@ -153,7 +214,6 @@ def chat(req: ChatRequest):
 
 @app.post("/chat/stream")
 def chat_stream(req: ChatRequest):
-    """ Streaming version - Full history sent to Groq every time """
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="message cannot be empty")
 
@@ -161,13 +221,14 @@ def chat_stream(req: ChatRequest):
     session = sessions[session_id]
 
     session["history"].append({"role": "user", "content": req.message})
+    context = retrieve_context(req.message)
 
     def generate():
         full_reply = ""
         try:
             stream = client.chat.completions.create(
                 model=MODEL,
-                messages=build_messages(session["history"]),   # ← Full history sent
+                messages=build_messages(session["history"], context),
                 max_tokens=MAX_TOKENS,
                 temperature=TEMPERATURE,
                 stream=True,
@@ -213,7 +274,7 @@ def clear_history(session_id: str):
     return {"status": "cleared", "session_id": session_id}
 
 
-@app.get("/sessions", response_model=list[SessionSummary])
+@app.get("/sessions", response_model=List[SessionSummary])
 def list_sessions():
     return [
         SessionSummary(
@@ -233,3 +294,13 @@ def delete_session(session_id: str):
         raise HTTPException(status_code=404, detail="session not found")
     del sessions[session_id]
     return {"status": "deleted", "session_id": session_id}
+
+@app.get("/chroma/status")
+def chroma_status():
+    return {
+        "status": "running",
+        "mode": "embedded_persistent",
+        "storage_path": "./chroma_db",
+        "collection": "devops_knowledge",
+        "document_count": collection.count()
+    }
